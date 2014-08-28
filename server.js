@@ -12,8 +12,18 @@ app.use(function(err, req, res, next) {
   return res.send(500, 'Something broke!');
 });
 
+var idxFile = join(__dirname, 'static/index.html');
+/*
+app.get('/v1/items', function(req, res){
+  return res.status(404).sendFile(idxFile);
+});
+*/
+app.get('/v1/items', function(req, res){
+  return res.status(200).json({'name':'the name', 'content': 'data'});
+});
+
+
 app.get('/*', function(req, res) {
-  var idxFile = join(__dirname, 'static/index.html');
   return res.status(200).sendFile(idxFile);
 });
 

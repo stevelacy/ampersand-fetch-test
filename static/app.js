@@ -1378,6 +1378,726 @@ exports.write = function(buffer, value, offset, isLE, mLen, nBytes) {
 };
 
 },{}],4:[function(require,module,exports){
+var BackboneEvents = require('backbone-events-standalone');
+var classExtend = require('ampersand-class-extend');
+var isArray = require('is-array');
+var extend = require('extend-object');
+var slice = [].slice;
+
+
+function Collection(models, options) {
+    options || (options = {});
+    if (options.model) this.model = options.model;
+    if (options.comparator) this.comparator = options.comparator;
+    if (options.parent) this.parent = options.parent;
+    this._reset();
+    this.initialize.apply(this, arguments);
+    if (models) this.reset(models, extend({silent: true}, options));
+}
+
+extend(Collection.prototype, BackboneEvents, {
+    initialize: function () {},
+
+    mainIndex: 'id',
+
+    indexes: [],
+
+    isModel: function (model) {
+        return this.model && model instanceof this.model;
+    },
+
+    add: function (models, options) {
+        return this.set(models, extend({merge: false, add: true, remove: false}, options));
+    },
+
+    // overridable parse method
+    parse: function (res, options) {
+        return res;
+    },
+
+    // overridable serialize method
+    serialize: function () {
+        return this.map(function (model) {
+            if (model.serialize) {
+                return model.serialize();
+            } else {
+                var out = {};
+                extend(out, model);
+                delete out.collection;
+                return out;
+            }
+        });
+    },
+
+    toJSON: function () {
+        return this.serialize();
+    },
+
+    set: function (models, options) {
+        options = extend({add: true, remove: true, merge: true}, options);
+        if (options.parse) models = this.parse(models, options);
+        var singular = !isArray(models);
+        models = singular ? (models ? [models] : []) : models.slice();
+        var id, model, attrs, existing, sort, i, length;
+        var at = options.at;
+        var sortable = this.comparator && (at == null) && options.sort !== false;
+        var sortAttr = ('string' === typeof this.comparator) ? this.comparator : null;
+        var toAdd = [], toRemove = [], modelMap = {};
+        var add = options.add, merge = options.merge, remove = options.remove;
+        var order = !sortable && add && remove ? [] : false;
+        var targetProto = this.model && this.model.prototype || Object.prototype;
+
+        // Turn bare objects into model references, and prevent invalid models
+        // from being added.
+        for (i = 0, length = models.length; i < length; i++) {
+            attrs = models[i] || {};
+            if (this.isModel(attrs)) {
+                id = model = attrs;
+            } else if (targetProto.generateId) {
+                id = targetProto.generateId(attrs);
+            } else {
+                id = attrs[targetProto.idAttribute || 'id'];
+            }
+
+            // If a duplicate is found, prevent it from being added and
+            // optionally merge it into the existing model.
+            if (existing = this.get(id)) {
+                if (remove) modelMap[existing.cid || existing.id] = true;
+                if (merge) {
+                    attrs = attrs === model ? model.attributes : attrs;
+                    if (options.parse) attrs = existing.parse(attrs, options);
+                    // if this is model
+                    if (existing.set) {
+                        existing.set(attrs, options);
+                        if (sortable && !sort && existing.hasChanged(sortAttr)) sort = true;
+                    } else {
+                        // if not just update the properties
+                        extend(existing, attrs);
+                    }
+                }
+                models[i] = existing;
+
+            // If this is a new, valid model, push it to the `toAdd` list.
+            } else if (add) {
+                model = models[i] = this._prepareModel(attrs, options);
+                if (!model) continue;
+                toAdd.push(model);
+                this._addReference(model, options);
+            }
+
+            // Do not add multiple models with the same `id`.
+            model = existing || model;
+            if (!model) continue;
+            if (order && ((model.isNew && model.isNew() || !model.id) || !modelMap[model.cid || model.id])) order.push(model);
+            modelMap[model.id] = true;
+        }
+
+        // Remove nonexistent models if appropriate.
+        if (remove) {
+            for (i = 0, length = this.length; i < length; i++) {
+                model = this.models[i];
+                if (!modelMap[model.cid || model.id]) toRemove.push(model);
+            }
+            if (toRemove.length) this.remove(toRemove, options);
+        }
+
+        // See if sorting is needed, update `length` and splice in new models.
+        if (toAdd.length || (order && order.length)) {
+            if (sortable) sort = true;
+            if (at != null) {
+                for (i = 0, length = toAdd.length; i < length; i++) {
+                    this.models.splice(at + i, 0, toAdd[i]);
+                }
+            } else {
+                var orderedModels = order || toAdd;
+                for (i = 0, length = orderedModels.length; i < length; i++) {
+                    this.models.push(orderedModels[i]);
+                }
+            }
+        }
+
+        // Silently sort the collection if appropriate.
+        if (sort) this.sort({silent: true});
+
+        // Unless silenced, it's time to fire all appropriate add/sort events.
+        if (!options.silent) {
+            for (i = 0, length = toAdd.length; i < length; i++) {
+                model = toAdd[i];
+                if (model.trigger) {
+                    model.trigger('add', model, this, options);
+                } else {
+                    this.trigger('add', model, this, options);
+                }
+            }
+            if (sort || (order && order.length)) this.trigger('sort', this, options);
+        }
+
+        // Return the added (or merged) model (or models).
+        return singular ? models[0] : models;
+    },
+
+    get: function (query, indexName) {
+        if (!query) return;
+        var index = this._indexes[indexName || this.mainIndex];
+        return index[query] || index[query[this.mainIndex]] || this._indexes.cid[query.cid];
+    },
+
+    // Get the model at the given index.
+    at: function (index) {
+        return this.models[index];
+    },
+
+    remove: function (models, options) {
+        var singular = !isArray(models);
+        var i, length, model, index;
+
+        models = singular ? [models] : slice.call(models);
+        options || (options = {});
+        for (i = 0, length = models.length; i < length; i++) {
+            model = models[i] = this.get(models[i]);
+            if (!model) continue;
+            this._deIndex(model);
+            index = this.models.indexOf(model);
+            this.models.splice(index, 1);
+            if (!options.silent) {
+                options.index = index;
+                if (model.trigger) {
+                    model.trigger('remove', model, this, options);
+                } else {
+                    this.trigger('remove', model, this, options);
+                }
+            }
+            this._removeReference(model, options);
+        }
+        return singular ? models[0] : models;
+    },
+
+    // When you have more items than you want to add or remove individually,
+    // you can reset the entire set with a new list of models, without firing
+    // any granular `add` or `remove` events. Fires `reset` when finished.
+    // Useful for bulk operations and optimizations.
+    reset: function (models, options) {
+        options || (options = {});
+        for (var i = 0, length = this.models.length; i < length; i++) {
+            this._removeReference(this.models[i], options);
+        }
+        options.previousModels = this.models;
+        this._reset();
+        models = this.add(models, extend({silent: true}, options));
+        if (!options.silent) this.trigger('reset', this, options);
+        return models;
+    },
+
+    sort: function (options) {
+        var self = this;
+        if (!this.comparator) throw new Error('Cannot sort a set without a comparator');
+        options || (options = {});
+
+        if (typeof this.comparator === 'string') {
+            this.models.sort(function (left, right) {
+                if (left.get) {
+                    left = left.get(self.comparator);
+                    right = right.get(self.comparator);
+                } else {
+                    left = left[self.comparator];
+                    right = right[self.comparator];
+                }
+                if (left > right || left === void 0) return 1;
+                if (left < right || right === void 0) return -1;
+                return 0;
+            });
+        } else if (this.comparator.length === 1) {
+            this.models.sort(function (left, right) {
+                left = self.comparator(left);
+                right = self.comparator(right);
+                if (left > right || left === void 0) return 1;
+                if (left < right || right === void 0) return -1;
+                return 0;
+            });
+        } else {
+            this.models.sort(this.comparator.bind(this));
+        }
+
+        if (!options.silent) this.trigger('sort', this, options);
+        return this;
+    },
+
+    // Private method to reset all internal state. Called when the collection
+    // is first initialized or reset.
+    _reset: function () {
+        var list = this.indexes || [];
+        var i = 0;
+        list.push(this.mainIndex);
+        list.push('cid');
+        var l = list.length;
+        this.models = [];
+        this._indexes = {};
+        for (; i < l; i++) {
+            this._indexes[list[i]] = {};
+        }
+    },
+
+    _prepareModel: function (attrs, options) {
+        // if we haven't defined a constructor, skip this
+        if (!this.model) return attrs;
+
+        if (this.isModel(attrs)) {
+            return attrs;
+        } else {
+            options = options ? extend({}, options) : {};
+            options.collection = this;
+            return new this.model(attrs, options);
+        }
+    },
+
+    _deIndex: function (model) {
+        for (var name in this._indexes) {
+            delete this._indexes[name][model[name] || (model.get && model.get(name))];
+        }
+    },
+
+    _index: function (model) {
+        for (var name in this._indexes) {
+            var indexVal = model[name] || (model.get && model.get(name));
+            if (indexVal) this._indexes[name][indexVal] = model;
+        }
+    },
+
+    // Internal method to create a model's ties to a collection.
+    _addReference: function (model, options) {
+        this._index(model);
+        if (!model.collection) model.collection = this;
+        if (model.on) model.on('all', this._onModelEvent, this);
+    },
+
+        // Internal method to sever a model's ties to a collection.
+    _removeReference: function (model, options) {
+        if (this === model.collection) delete model.collection;
+        this._deIndex(model);
+        if (model.off) model.off('all', this._onModelEvent, this);
+    },
+
+    _onModelEvent: function (event, model, collection, options) {
+        if ((event === 'add' || event === 'remove') && collection !== this) return;
+        if (event === 'destroy') this.remove(model, options);
+        if (model && event === 'change:' + model.idAttribute) {
+            this._deIndex(model);
+            this._index(model);
+        }
+        this.trigger.apply(this, arguments);
+    }
+});
+
+Object.defineProperties(Collection.prototype, {
+    length: {
+        get: function () {
+            return this.models.length;
+        }
+    },
+    isCollection: {
+        value: true
+    }
+});
+
+var arrayMethods = [
+    'indexOf',
+    'lastIndexOf',
+    'every',
+    'some',
+    'forEach',
+    'map',
+    'filter',
+    'reduce',
+    'reduceRight'
+];
+
+arrayMethods.forEach(function (method) {
+    Collection.prototype[method] = function () {
+        return this.models[method].apply(this.models, arguments);
+    };
+});
+
+// alias each/forEach for maximum compatibility
+Collection.prototype.each = Collection.prototype.forEach;
+
+Collection.extend = classExtend;
+
+module.exports = Collection;
+
+},{"ampersand-class-extend":5,"backbone-events-standalone":7,"extend-object":8,"is-array":9}],5:[function(require,module,exports){
+var objectExtend = require('extend-object');
+
+
+/// Following code is largely pasted from Backbone.js
+
+// Helper function to correctly set up the prototype chain, for subclasses.
+// Similar to `goog.inherits`, but uses a hash of prototype properties and
+// class properties to be extended.
+var extend = function(protoProps) {
+    var parent = this;
+    var child;
+    var args = [].slice.call(arguments);
+
+    // The constructor function for the new subclass is either defined by you
+    // (the "constructor" property in your `extend` definition), or defaulted
+    // by us to simply call the parent's constructor.
+    if (protoProps && protoProps.hasOwnProperty('constructor')) {
+        child = protoProps.constructor;
+    } else {
+        child = function () {
+            return parent.apply(this, arguments);
+        };
+    }
+
+    // Add static properties to the constructor function from parent
+    objectExtend(child, parent);
+
+    // Set the prototype chain to inherit from `parent`, without calling
+    // `parent`'s constructor function.
+    var Surrogate = function(){ this.constructor = child; };
+    Surrogate.prototype = parent.prototype;
+    child.prototype = new Surrogate();
+
+    // Mix in all prototype properties to the subclass if supplied.
+    if (protoProps) {
+        args.unshift(child.prototype);
+        objectExtend.apply(null, args);
+    }
+
+    // Set a convenience property in case the parent's prototype is needed
+    // later.
+    child.__super__ = parent.prototype;
+
+    return child;
+};
+
+// Expose the extend function
+module.exports = extend;
+
+},{"extend-object":8}],6:[function(require,module,exports){
+/**
+ * Standalone extraction of Backbone.Events, no external dependency required.
+ * Degrades nicely when Backone/underscore are already available in the current
+ * global context.
+ *
+ * Note that docs suggest to use underscore's `_.extend()` method to add Events
+ * support to some given object. A `mixin()` method has been added to the Events
+ * prototype to avoid using underscore for that sole purpose:
+ *
+ *     var myEventEmitter = BackboneEvents.mixin({});
+ *
+ * Or for a function constructor:
+ *
+ *     function MyConstructor(){}
+ *     MyConstructor.prototype.foo = function(){}
+ *     BackboneEvents.mixin(MyConstructor.prototype);
+ *
+ * (c) 2009-2013 Jeremy Ashkenas, DocumentCloud Inc.
+ * (c) 2013 Nicolas Perriault
+ */
+/* global exports:true, define, module */
+(function() {
+  var root = this,
+      breaker = {},
+      nativeForEach = Array.prototype.forEach,
+      hasOwnProperty = Object.prototype.hasOwnProperty,
+      slice = Array.prototype.slice,
+      idCounter = 0;
+
+  // Returns a partial implementation matching the minimal API subset required
+  // by Backbone.Events
+  function miniscore() {
+    return {
+      keys: Object.keys,
+
+      uniqueId: function(prefix) {
+        var id = ++idCounter + '';
+        return prefix ? prefix + id : id;
+      },
+
+      has: function(obj, key) {
+        return hasOwnProperty.call(obj, key);
+      },
+
+      each: function(obj, iterator, context) {
+        if (obj == null) return;
+        if (nativeForEach && obj.forEach === nativeForEach) {
+          obj.forEach(iterator, context);
+        } else if (obj.length === +obj.length) {
+          for (var i = 0, l = obj.length; i < l; i++) {
+            if (iterator.call(context, obj[i], i, obj) === breaker) return;
+          }
+        } else {
+          for (var key in obj) {
+            if (this.has(obj, key)) {
+              if (iterator.call(context, obj[key], key, obj) === breaker) return;
+            }
+          }
+        }
+      },
+
+      once: function(func) {
+        var ran = false, memo;
+        return function() {
+          if (ran) return memo;
+          ran = true;
+          memo = func.apply(this, arguments);
+          func = null;
+          return memo;
+        };
+      }
+    };
+  }
+
+  var _ = miniscore(), Events;
+
+  // Backbone.Events
+  // ---------------
+
+  // A module that can be mixed in to *any object* in order to provide it with
+  // custom events. You may bind with `on` or remove with `off` callback
+  // functions to an event; `trigger`-ing an event fires all callbacks in
+  // succession.
+  //
+  //     var object = {};
+  //     _.extend(object, Backbone.Events);
+  //     object.on('expand', function(){ alert('expanded'); });
+  //     object.trigger('expand');
+  //
+  Events = {
+
+    // Bind an event to a `callback` function. Passing `"all"` will bind
+    // the callback to all events fired.
+    on: function(name, callback, context) {
+      if (!eventsApi(this, 'on', name, [callback, context]) || !callback) return this;
+      this._events || (this._events = {});
+      var events = this._events[name] || (this._events[name] = []);
+      events.push({callback: callback, context: context, ctx: context || this});
+      return this;
+    },
+
+    // Bind an event to only be triggered a single time. After the first time
+    // the callback is invoked, it will be removed.
+    once: function(name, callback, context) {
+      if (!eventsApi(this, 'once', name, [callback, context]) || !callback) return this;
+      var self = this;
+      var once = _.once(function() {
+        self.off(name, once);
+        callback.apply(this, arguments);
+      });
+      once._callback = callback;
+      return this.on(name, once, context);
+    },
+
+    // Remove one or many callbacks. If `context` is null, removes all
+    // callbacks with that function. If `callback` is null, removes all
+    // callbacks for the event. If `name` is null, removes all bound
+    // callbacks for all events.
+    off: function(name, callback, context) {
+      var retain, ev, events, names, i, l, j, k;
+      if (!this._events || !eventsApi(this, 'off', name, [callback, context])) return this;
+      if (!name && !callback && !context) {
+        this._events = {};
+        return this;
+      }
+
+      names = name ? [name] : _.keys(this._events);
+      for (i = 0, l = names.length; i < l; i++) {
+        name = names[i];
+        if (events = this._events[name]) {
+          this._events[name] = retain = [];
+          if (callback || context) {
+            for (j = 0, k = events.length; j < k; j++) {
+              ev = events[j];
+              if ((callback && callback !== ev.callback && callback !== ev.callback._callback) ||
+                  (context && context !== ev.context)) {
+                retain.push(ev);
+              }
+            }
+          }
+          if (!retain.length) delete this._events[name];
+        }
+      }
+
+      return this;
+    },
+
+    // Trigger one or many events, firing all bound callbacks. Callbacks are
+    // passed the same arguments as `trigger` is, apart from the event name
+    // (unless you're listening on `"all"`, which will cause your callback to
+    // receive the true name of the event as the first argument).
+    trigger: function(name) {
+      if (!this._events) return this;
+      var args = slice.call(arguments, 1);
+      if (!eventsApi(this, 'trigger', name, args)) return this;
+      var events = this._events[name];
+      var allEvents = this._events.all;
+      if (events) triggerEvents(events, args);
+      if (allEvents) triggerEvents(allEvents, arguments);
+      return this;
+    },
+
+    // Tell this object to stop listening to either specific events ... or
+    // to every object it's currently listening to.
+    stopListening: function(obj, name, callback) {
+      var listeners = this._listeners;
+      if (!listeners) return this;
+      var deleteListener = !name && !callback;
+      if (typeof name === 'object') callback = this;
+      if (obj) (listeners = {})[obj._listenerId] = obj;
+      for (var id in listeners) {
+        listeners[id].off(name, callback, this);
+        if (deleteListener) delete this._listeners[id];
+      }
+      return this;
+    }
+
+  };
+
+  // Regular expression used to split event strings.
+  var eventSplitter = /\s+/;
+
+  // Implement fancy features of the Events API such as multiple event
+  // names `"change blur"` and jQuery-style event maps `{change: action}`
+  // in terms of the existing API.
+  var eventsApi = function(obj, action, name, rest) {
+    if (!name) return true;
+
+    // Handle event maps.
+    if (typeof name === 'object') {
+      for (var key in name) {
+        obj[action].apply(obj, [key, name[key]].concat(rest));
+      }
+      return false;
+    }
+
+    // Handle space separated event names.
+    if (eventSplitter.test(name)) {
+      var names = name.split(eventSplitter);
+      for (var i = 0, l = names.length; i < l; i++) {
+        obj[action].apply(obj, [names[i]].concat(rest));
+      }
+      return false;
+    }
+
+    return true;
+  };
+
+  // A difficult-to-believe, but optimized internal dispatch function for
+  // triggering events. Tries to keep the usual cases speedy (most internal
+  // Backbone events have 3 arguments).
+  var triggerEvents = function(events, args) {
+    var ev, i = -1, l = events.length, a1 = args[0], a2 = args[1], a3 = args[2];
+    switch (args.length) {
+      case 0: while (++i < l) (ev = events[i]).callback.call(ev.ctx); return;
+      case 1: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1); return;
+      case 2: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1, a2); return;
+      case 3: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1, a2, a3); return;
+      default: while (++i < l) (ev = events[i]).callback.apply(ev.ctx, args);
+    }
+  };
+
+  var listenMethods = {listenTo: 'on', listenToOnce: 'once'};
+
+  // Inversion-of-control versions of `on` and `once`. Tell *this* object to
+  // listen to an event in another object ... keeping track of what it's
+  // listening to.
+  _.each(listenMethods, function(implementation, method) {
+    Events[method] = function(obj, name, callback) {
+      var listeners = this._listeners || (this._listeners = {});
+      var id = obj._listenerId || (obj._listenerId = _.uniqueId('l'));
+      listeners[id] = obj;
+      if (typeof name === 'object') callback = this;
+      obj[implementation](name, callback, this);
+      return this;
+    };
+  });
+
+  // Aliases for backwards compatibility.
+  Events.bind   = Events.on;
+  Events.unbind = Events.off;
+
+  // Mixin utility
+  Events.mixin = function(proto) {
+    var exports = ['on', 'once', 'off', 'trigger', 'stopListening', 'listenTo',
+                   'listenToOnce', 'bind', 'unbind'];
+    _.each(exports, function(name) {
+      proto[name] = this[name];
+    }, this);
+    return proto;
+  };
+
+  // Export Events as BackboneEvents depending on current context
+  if (typeof define === "function") {
+    define(function() {
+      return Events;
+    });
+  } else if (typeof exports !== 'undefined') {
+    if (typeof module !== 'undefined' && module.exports) {
+      exports = module.exports = Events;
+    }
+    exports.BackboneEvents = Events;
+  } else {
+    root.BackboneEvents = Events;
+  }
+})(this);
+
+},{}],7:[function(require,module,exports){
+module.exports = require('./backbone-events-standalone');
+
+},{"./backbone-events-standalone":6}],8:[function(require,module,exports){
+var arr = [];
+var each = arr.forEach;
+var slice = arr.slice;
+
+
+module.exports = function(obj) {
+    each.call(slice.call(arguments, 1), function(source) {
+        if (source) {
+            for (var prop in source) {
+                obj[prop] = source[prop];
+            }
+        }
+    });
+    return obj;
+};
+
+},{}],9:[function(require,module,exports){
+
+/**
+ * isArray
+ */
+
+var isArray = Array.isArray;
+
+/**
+ * toString
+ */
+
+var str = Object.prototype.toString;
+
+/**
+ * Whether or not the given `val`
+ * is an array.
+ *
+ * example:
+ *
+ *        isArray([]);
+ *        // > true
+ *        isArray(arguments);
+ *        // > false
+ *        isArray('');
+ *        // > false
+ *
+ * @param {mixed} val
+ * @return {bool}
+ */
+
+module.exports = isArray || function (val) {
+  return !! val && '[object Array]' == str.call(val);
+};
+
+},{}],10:[function(require,module,exports){
 var State = require('ampersand-state');
 var _ = require('underscore');
 var sync = require('ampersand-sync');
@@ -1436,11 +2156,25 @@ var Model = State.extend({
     // model differs from its current attributes, they will be overridden,
     // triggering a `"change"` event.
     fetch: function (options) {
+        var tryParseJSON = function(o){
+            try {
+                // Check if the string is object
+                if (o && typeof o === "object" && o !== null) {
+                    return o;
+                }
+            }
+            catch (e) {}
+            return false;
+        };
         options = options ? _.clone(options) : {};
         if (options.parse === void 0) options.parse = true;
         var model = this;
         var success = options.success;
         options.success = function (resp) {
+            if (!tryParseJSON(resp)){
+                options.error(resp);
+                return false;
+            }
             if (!model.set(model.parse(resp, options), options)) return false;
             if (success) success(model, resp, options);
             model.trigger('sync', model, resp, options);
@@ -1510,7 +2244,7 @@ var wrapError = function (model, options) {
 
 module.exports = Model;
 
-},{"ampersand-state":5,"ampersand-sync":10,"underscore":24}],5:[function(require,module,exports){
+},{"ampersand-state":11,"ampersand-sync":16,"underscore":30}],11:[function(require,module,exports){
 var _ = require('underscore');
 var BBEvents = require('backbone-events-standalone');
 var KeyTree = require('key-tree-store');
@@ -2277,7 +3011,7 @@ Base.extend = extend;
 // Our main exports
 module.exports = Base;
 
-},{"array-next":6,"backbone-events-standalone":8,"key-tree-store":9,"underscore":24}],6:[function(require,module,exports){
+},{"array-next":12,"backbone-events-standalone":14,"key-tree-store":15,"underscore":30}],12:[function(require,module,exports){
 module.exports = function arrayNext(array, currentItem) {
     var len = array.length;
     var newIndex = array.indexOf(currentItem) + 1;
@@ -2285,278 +3019,11 @@ module.exports = function arrayNext(array, currentItem) {
     return array[newIndex];
 };
 
-},{}],7:[function(require,module,exports){
-/**
- * Standalone extraction of Backbone.Events, no external dependency required.
- * Degrades nicely when Backone/underscore are already available in the current
- * global context.
- *
- * Note that docs suggest to use underscore's `_.extend()` method to add Events
- * support to some given object. A `mixin()` method has been added to the Events
- * prototype to avoid using underscore for that sole purpose:
- *
- *     var myEventEmitter = BackboneEvents.mixin({});
- *
- * Or for a function constructor:
- *
- *     function MyConstructor(){}
- *     MyConstructor.prototype.foo = function(){}
- *     BackboneEvents.mixin(MyConstructor.prototype);
- *
- * (c) 2009-2013 Jeremy Ashkenas, DocumentCloud Inc.
- * (c) 2013 Nicolas Perriault
- */
-/* global exports:true, define, module */
-(function() {
-  var root = this,
-      breaker = {},
-      nativeForEach = Array.prototype.forEach,
-      hasOwnProperty = Object.prototype.hasOwnProperty,
-      slice = Array.prototype.slice,
-      idCounter = 0;
-
-  // Returns a partial implementation matching the minimal API subset required
-  // by Backbone.Events
-  function miniscore() {
-    return {
-      keys: Object.keys,
-
-      uniqueId: function(prefix) {
-        var id = ++idCounter + '';
-        return prefix ? prefix + id : id;
-      },
-
-      has: function(obj, key) {
-        return hasOwnProperty.call(obj, key);
-      },
-
-      each: function(obj, iterator, context) {
-        if (obj == null) return;
-        if (nativeForEach && obj.forEach === nativeForEach) {
-          obj.forEach(iterator, context);
-        } else if (obj.length === +obj.length) {
-          for (var i = 0, l = obj.length; i < l; i++) {
-            if (iterator.call(context, obj[i], i, obj) === breaker) return;
-          }
-        } else {
-          for (var key in obj) {
-            if (this.has(obj, key)) {
-              if (iterator.call(context, obj[key], key, obj) === breaker) return;
-            }
-          }
-        }
-      },
-
-      once: function(func) {
-        var ran = false, memo;
-        return function() {
-          if (ran) return memo;
-          ran = true;
-          memo = func.apply(this, arguments);
-          func = null;
-          return memo;
-        };
-      }
-    };
-  }
-
-  var _ = miniscore(), Events;
-
-  // Backbone.Events
-  // ---------------
-
-  // A module that can be mixed in to *any object* in order to provide it with
-  // custom events. You may bind with `on` or remove with `off` callback
-  // functions to an event; `trigger`-ing an event fires all callbacks in
-  // succession.
-  //
-  //     var object = {};
-  //     _.extend(object, Backbone.Events);
-  //     object.on('expand', function(){ alert('expanded'); });
-  //     object.trigger('expand');
-  //
-  Events = {
-
-    // Bind an event to a `callback` function. Passing `"all"` will bind
-    // the callback to all events fired.
-    on: function(name, callback, context) {
-      if (!eventsApi(this, 'on', name, [callback, context]) || !callback) return this;
-      this._events || (this._events = {});
-      var events = this._events[name] || (this._events[name] = []);
-      events.push({callback: callback, context: context, ctx: context || this});
-      return this;
-    },
-
-    // Bind an event to only be triggered a single time. After the first time
-    // the callback is invoked, it will be removed.
-    once: function(name, callback, context) {
-      if (!eventsApi(this, 'once', name, [callback, context]) || !callback) return this;
-      var self = this;
-      var once = _.once(function() {
-        self.off(name, once);
-        callback.apply(this, arguments);
-      });
-      once._callback = callback;
-      return this.on(name, once, context);
-    },
-
-    // Remove one or many callbacks. If `context` is null, removes all
-    // callbacks with that function. If `callback` is null, removes all
-    // callbacks for the event. If `name` is null, removes all bound
-    // callbacks for all events.
-    off: function(name, callback, context) {
-      var retain, ev, events, names, i, l, j, k;
-      if (!this._events || !eventsApi(this, 'off', name, [callback, context])) return this;
-      if (!name && !callback && !context) {
-        this._events = {};
-        return this;
-      }
-
-      names = name ? [name] : _.keys(this._events);
-      for (i = 0, l = names.length; i < l; i++) {
-        name = names[i];
-        if (events = this._events[name]) {
-          this._events[name] = retain = [];
-          if (callback || context) {
-            for (j = 0, k = events.length; j < k; j++) {
-              ev = events[j];
-              if ((callback && callback !== ev.callback && callback !== ev.callback._callback) ||
-                  (context && context !== ev.context)) {
-                retain.push(ev);
-              }
-            }
-          }
-          if (!retain.length) delete this._events[name];
-        }
-      }
-
-      return this;
-    },
-
-    // Trigger one or many events, firing all bound callbacks. Callbacks are
-    // passed the same arguments as `trigger` is, apart from the event name
-    // (unless you're listening on `"all"`, which will cause your callback to
-    // receive the true name of the event as the first argument).
-    trigger: function(name) {
-      if (!this._events) return this;
-      var args = slice.call(arguments, 1);
-      if (!eventsApi(this, 'trigger', name, args)) return this;
-      var events = this._events[name];
-      var allEvents = this._events.all;
-      if (events) triggerEvents(events, args);
-      if (allEvents) triggerEvents(allEvents, arguments);
-      return this;
-    },
-
-    // Tell this object to stop listening to either specific events ... or
-    // to every object it's currently listening to.
-    stopListening: function(obj, name, callback) {
-      var listeners = this._listeners;
-      if (!listeners) return this;
-      var deleteListener = !name && !callback;
-      if (typeof name === 'object') callback = this;
-      if (obj) (listeners = {})[obj._listenerId] = obj;
-      for (var id in listeners) {
-        listeners[id].off(name, callback, this);
-        if (deleteListener) delete this._listeners[id];
-      }
-      return this;
-    }
-
-  };
-
-  // Regular expression used to split event strings.
-  var eventSplitter = /\s+/;
-
-  // Implement fancy features of the Events API such as multiple event
-  // names `"change blur"` and jQuery-style event maps `{change: action}`
-  // in terms of the existing API.
-  var eventsApi = function(obj, action, name, rest) {
-    if (!name) return true;
-
-    // Handle event maps.
-    if (typeof name === 'object') {
-      for (var key in name) {
-        obj[action].apply(obj, [key, name[key]].concat(rest));
-      }
-      return false;
-    }
-
-    // Handle space separated event names.
-    if (eventSplitter.test(name)) {
-      var names = name.split(eventSplitter);
-      for (var i = 0, l = names.length; i < l; i++) {
-        obj[action].apply(obj, [names[i]].concat(rest));
-      }
-      return false;
-    }
-
-    return true;
-  };
-
-  // A difficult-to-believe, but optimized internal dispatch function for
-  // triggering events. Tries to keep the usual cases speedy (most internal
-  // Backbone events have 3 arguments).
-  var triggerEvents = function(events, args) {
-    var ev, i = -1, l = events.length, a1 = args[0], a2 = args[1], a3 = args[2];
-    switch (args.length) {
-      case 0: while (++i < l) (ev = events[i]).callback.call(ev.ctx); return;
-      case 1: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1); return;
-      case 2: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1, a2); return;
-      case 3: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1, a2, a3); return;
-      default: while (++i < l) (ev = events[i]).callback.apply(ev.ctx, args);
-    }
-  };
-
-  var listenMethods = {listenTo: 'on', listenToOnce: 'once'};
-
-  // Inversion-of-control versions of `on` and `once`. Tell *this* object to
-  // listen to an event in another object ... keeping track of what it's
-  // listening to.
-  _.each(listenMethods, function(implementation, method) {
-    Events[method] = function(obj, name, callback) {
-      var listeners = this._listeners || (this._listeners = {});
-      var id = obj._listenerId || (obj._listenerId = _.uniqueId('l'));
-      listeners[id] = obj;
-      if (typeof name === 'object') callback = this;
-      obj[implementation](name, callback, this);
-      return this;
-    };
-  });
-
-  // Aliases for backwards compatibility.
-  Events.bind   = Events.on;
-  Events.unbind = Events.off;
-
-  // Mixin utility
-  Events.mixin = function(proto) {
-    var exports = ['on', 'once', 'off', 'trigger', 'stopListening', 'listenTo',
-                   'listenToOnce', 'bind', 'unbind'];
-    _.each(exports, function(name) {
-      proto[name] = this[name];
-    }, this);
-    return proto;
-  };
-
-  // Export Events as BackboneEvents depending on current context
-  if (typeof define === "function") {
-    define(function() {
-      return Events;
-    });
-  } else if (typeof exports !== 'undefined') {
-    if (typeof module !== 'undefined' && module.exports) {
-      exports = module.exports = Events;
-    }
-    exports.BackboneEvents = Events;
-  } else {
-    root.BackboneEvents = Events;
-  }
-})(this);
-
-},{}],8:[function(require,module,exports){
-module.exports = require('./backbone-events-standalone');
-
-},{"./backbone-events-standalone":7}],9:[function(require,module,exports){
+},{}],13:[function(require,module,exports){
+module.exports=require(6)
+},{}],14:[function(require,module,exports){
+module.exports=require(7)
+},{"./backbone-events-standalone":13}],15:[function(require,module,exports){
 function KeyTreeStore() {
     this.storage = {};
 }
@@ -2597,7 +3064,7 @@ KeyTreeStore.prototype.get = function (keypath) {
 
 module.exports = KeyTreeStore;
 
-},{}],10:[function(require,module,exports){
+},{}],16:[function(require,module,exports){
 var _ = require('underscore');
 var xhr = require('xhr');
 var qs = require('qs');
@@ -2718,10 +3185,10 @@ var methodMap = {
     'read':   'GET'
 };
 
-},{"qs":11,"underscore":16,"xhr":17}],11:[function(require,module,exports){
+},{"qs":17,"underscore":22,"xhr":23}],17:[function(require,module,exports){
 module.exports = require('./lib');
 
-},{"./lib":12}],12:[function(require,module,exports){
+},{"./lib":18}],18:[function(require,module,exports){
 // Load modules
 
 var Stringify = require('./stringify');
@@ -2738,7 +3205,7 @@ module.exports = {
     parse: Parse
 };
 
-},{"./parse":13,"./stringify":14}],13:[function(require,module,exports){
+},{"./parse":19,"./stringify":20}],19:[function(require,module,exports){
 // Load modules
 
 var Utils = require('./utils');
@@ -2895,7 +3362,7 @@ module.exports = function (str, depth, delimiter) {
     return Utils.compact(obj);
 };
 
-},{"./utils":15}],14:[function(require,module,exports){
+},{"./utils":21}],20:[function(require,module,exports){
 (function (Buffer){
 // Load modules
 
@@ -2954,7 +3421,7 @@ module.exports = function (obj, delimiter) {
 };
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":1}],15:[function(require,module,exports){
+},{"buffer":1}],21:[function(require,module,exports){
 (function (Buffer){
 // Load modules
 
@@ -3091,7 +3558,7 @@ exports.compact = function (obj) {
 };
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":1}],16:[function(require,module,exports){
+},{"buffer":1}],22:[function(require,module,exports){
 //     Underscore.js 1.6.0
 //     http://underscorejs.org
 //     (c) 2009-2014 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
@@ -4436,7 +4903,7 @@ exports.compact = function (obj) {
   }
 }).call(this);
 
-},{}],17:[function(require,module,exports){
+},{}],23:[function(require,module,exports){
 var window = require("global/window")
 var once = require("once")
 var parseHeaders = require('parse-headers')
@@ -4608,7 +5075,7 @@ function createXHR(options, callback) {
 
 function noop() {}
 
-},{"global/window":18,"once":19,"parse-headers":23}],18:[function(require,module,exports){
+},{"global/window":24,"once":25,"parse-headers":29}],24:[function(require,module,exports){
 (function (global){
 if (typeof window !== "undefined") {
     module.exports = window
@@ -4619,7 +5086,7 @@ if (typeof window !== "undefined") {
 }
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],19:[function(require,module,exports){
+},{}],25:[function(require,module,exports){
 module.exports = once
 
 once.proto = once(function () {
@@ -4640,7 +5107,7 @@ function once (fn) {
   }
 }
 
-},{}],20:[function(require,module,exports){
+},{}],26:[function(require,module,exports){
 var isFunction = require('is-function')
 
 module.exports = forEach
@@ -4688,7 +5155,7 @@ function forEachObject(object, iterator, context) {
     }
 }
 
-},{"is-function":21}],21:[function(require,module,exports){
+},{"is-function":27}],27:[function(require,module,exports){
 module.exports = isFunction
 
 var toString = Object.prototype.toString
@@ -4705,7 +5172,7 @@ function isFunction (fn) {
       fn === window.prompt))
 };
 
-},{}],22:[function(require,module,exports){
+},{}],28:[function(require,module,exports){
 
 exports = module.exports = trim;
 
@@ -4721,7 +5188,7 @@ exports.right = function(str){
   return str.replace(/\s*$/, '');
 };
 
-},{}],23:[function(require,module,exports){
+},{}],29:[function(require,module,exports){
 var trim = require('trim')
   , forEach = require('for-each')
 
@@ -4743,7 +5210,7 @@ module.exports = function (headers) {
 
   return result
 }
-},{"for-each":20,"trim":22}],24:[function(require,module,exports){
+},{"for-each":26,"trim":28}],30:[function(require,module,exports){
 //     Underscore.js 1.7.0
 //     http://underscorejs.org
 //     (c) 2009-2014 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
@@ -6160,7 +6627,9 @@ module.exports = function (headers) {
   }
 }.call(this));
 
-},{}],25:[function(require,module,exports){
+},{}],31:[function(require,module,exports){
+var Collection = require('ampersand-collection');
+
 var Model = require('./model');
 var model = new Model();
 
@@ -6173,7 +6642,8 @@ model.fetch({
   }
 });
 
-},{"./model":26}],26:[function(require,module,exports){
+console.log(model.fetch);
+},{"./model":32,"ampersand-collection":4}],32:[function(require,module,exports){
 var AmpersandModel = require('ampersand-model');
 
 var Model = AmpersandModel.extend({
@@ -6186,4 +6656,4 @@ var Model = AmpersandModel.extend({
 
 module.exports = Model;
 
-},{"ampersand-model":4}]},{},[25]);
+},{"ampersand-model":10}]},{},[31]);
